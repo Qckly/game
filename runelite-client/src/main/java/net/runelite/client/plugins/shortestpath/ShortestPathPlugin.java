@@ -115,7 +115,7 @@ public class ShortestPathPlugin extends Plugin
     @Override
     protected Module getPublicModule()
     {
-        return binder -> binder.bind(ShortestPathPlugin.class).toInstance(this);
+        return binder -> binder.bind(ShortestPathPlugin.class).toProvider(() -> this);
     }
 
 	protected static final String CONFIG_GROUP = "shortestpath";
