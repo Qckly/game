@@ -11,7 +11,7 @@ import lombok.extern.slf4j.Slf4j;
  * Supports both varbit and varplayer requirements.
  *
  * <p>
- * Format: {@code <id><check><value>} where check is one of: = > < & @
+ * Format: {@code <id><check><value>} where check is one of: {@code = > < & @}
  * </p>
  * <p>
  * Multiple requirements are separated by semicolons.

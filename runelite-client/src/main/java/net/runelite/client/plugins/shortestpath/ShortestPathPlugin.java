@@ -1801,7 +1801,7 @@ public class ShortestPathPlugin extends Plugin
 	 * transports for the edge between them.
 	 * <p>
 	 * When the destination step carries the transport the search actually chose (steps built by
-	 * {@link NodeGraph#getPathSteps} do), that transport is the answer and this function returns
+     * {@code NodeGraph.getPathSteps} do), that transport is the answer and this function returns
 	 * it directly as a singleton — reconstruction is only a fallback for identity-less steps
 	 * (e.g. steps built via the two-argument {@link PathStep} constructor). The destination-based
 	 * fallback remains inherently ambiguous when multiple valid transports share the same
