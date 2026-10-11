@@ -1,0 +1,28 @@
+package net.runelite.client.plugins.shortestpath;
+
+import lombok.RequiredArgsConstructor;
+
+@RequiredArgsConstructor
+public enum TileStyle
+{
+	TILES("Tiles"),
+	LINES("Lines"),
+	ARROW_LINE("Arrow line"),
+	TURN_MARKERS("Turn markers"),
+	TRACER("Tracer"),
+	SPRITE_MARKERS("Sprite markers");
+
+	private final String type;
+
+	public static TileStyle fromType(String type)
+	{
+		for (TileStyle tileStyle : values())
+		{
+			if (tileStyle.type.equals(type))
+			{
+				return tileStyle;
+			}
+		}
+		return null;
+	}
+}
