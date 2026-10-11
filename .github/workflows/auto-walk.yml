@@ -21,7 +21,10 @@ jobs:
           java-version: 11
       - uses: gradle/actions/setup-gradle@v4
       - name: Compile and check auto-walk
-        run: ./gradlew :client:compileJava :client:compileTestJava :client:checkstyleMain :client:checkstyleTest :client:pmdMain :client:test --tests 'net.runelite.client.plugins.autowalk.*' --tests 'net.runelite.client.plugins.shortestpath.*' --stacktrace
+        run: ./gradlew :client:compileJava :client:compileTestJava :client:checkstyleMain :client:checkstyleTest :client:pmdMain :client:test --tests 'net.runelite.client.plugins.autowalk.*' --tests 'net.runelite.client.plugins.shortestpath.*' --tests 'net.runelite.client.plugins.PluginManagerTest' --stacktrace
+      - name: Show plugin loading failure
+        if: failure()
+        run: cat runelite-client/build/test-results/test/TEST-net.runelite.client.plugins.PluginManagerTest.xml
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
