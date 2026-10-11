@@ -131,6 +131,7 @@ val prepareShortestPathCollisionMap = tasks.register("prepareShortestPathCollisi
 }
 sourceSets.main { resources.srcDir(shortestPathGeneratedResources) }
 tasks.processResources { dependsOn(prepareShortestPathCollisionMap) }
+tasks.named("sourcesJar") { dependsOn(prepareShortestPathCollisionMap) }
 
 val shadowJar = tasks.register<Jar>("shadowJar") {
     dependsOn(configurations.runtimeClasspath)
