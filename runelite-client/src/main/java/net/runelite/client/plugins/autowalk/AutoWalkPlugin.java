@@ -23,6 +23,7 @@ import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.PluginMessage;
+import net.runelite.client.events.OverlayMenuClicked;
 import net.runelite.client.input.KeyListener;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.input.MouseAdapter;
@@ -275,6 +276,15 @@ public class AutoWalkPlugin extends Plugin implements KeyListener
 		if (!session.isActive())
 		{
 			shortestPath.endAutoWalk();
+		}
+	}
+
+	@Subscribe
+	public void onOverlayMenuClicked(OverlayMenuClicked event)
+	{
+		if (event.getOverlay() == overlay && "Stop auto-walk".equals(event.getEntry().getOption()))
+		{
+			stop("Stopped by user");
 		}
 	}
 

@@ -230,6 +230,8 @@ tasks.checkstyleMain {
 tasks.checkstyleTest { exclude("net/runelite/client/plugins/shortestpath/**") } // vendored tests
 
 tasks.withType<Test> {
+    // Full-world pathfinder fixtures exceed Gradle's default 512 MiB test heap.
+    maxHeapSize = "2g"
     systemProperty("glslang.path", providers.gradleProperty("glslangPath").getOrElse(""))
 }
 

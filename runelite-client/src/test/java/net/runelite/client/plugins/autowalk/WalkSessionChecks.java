@@ -26,6 +26,7 @@ public final class WalkSessionChecks
 		collisionChecks();
 		objectActionChecks();
 		journeyPolicyChecks();
+		positionJitterIsNotProgress();
 	}
 
 	private static WalkSession.Tile tile(int x)
@@ -170,5 +171,16 @@ public final class WalkSessionChecks
 		check(JourneyPolicy.isWorldInteraction(9), "manual NPC interaction cancels movement");
 		check(!JourneyPolicy.isWorldInteraction(57), "closing world map does not cancel journey");
 		check(JourneyPolicy.isMinimapPress(1, true) && !JourneyPolicy.isMinimapPress(3, true), "only left minimap click cancels");
+	}
+
+	private static void positionJitterIsNotProgress()
+	{
+		WalkSession s = new WalkSession(3, 1);
+		s.acceptRoute(s.start(tile(30), 0), road(30), 0);
+		s.tick(tile(0), false, false, 0, p -> true);
+		s.tick(new WalkSession.Tile(0, 11, 0), false, true, 1, p -> true);
+		s.tick(tile(0), false, true, 2, p -> true);
+		check(s.tick(new WalkSession.Tile(0, 11, 0), false, true, 3, p -> true).kind == WalkSession.Kind.REPLAN,
+			"position oscillation without route progress triggers recovery");
 	}
 }

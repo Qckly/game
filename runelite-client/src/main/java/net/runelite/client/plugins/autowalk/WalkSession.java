@@ -98,6 +98,7 @@ public final class WalkSession
 	private int planTick;
 	private int actionTick = -100;
 	private int replans;
+	private int bestWaypointDistance = Integer.MAX_VALUE;
 	private String reason = "";
 
 	public WalkSession(int stuckTicks, int maxReplans)
@@ -200,22 +201,18 @@ public final class WalkSession
 			reason = "Destination reached";
 			return NONE;
 		}
-		if (!position.equals(lastPosition))
+		if (lastPosition == null || (waypoint != null && position.distance(waypoint) < bestWaypointDistance))
 		{
 			progressTick = tick;
-			lastPosition = position;
+			bestWaypointDistance = waypoint == null ? Integer.MAX_VALUE : position.distance(waypoint);
 		}
+		lastPosition = position;
 		if (state == State.WAITING_FOR_REGION)
 		{
 			state = State.WALKING;
 			waypoint = null;
 			progressTick = tick;
 		}
-		if (tick - progressTick >= stuckTicks)
-		{
-			return replan(tick, "No movement progress");
-		}
-
 		// Match only before the next unacknowledged transport. Its destination acknowledges it.
 		int boundary = route.size() - 1;
 		for (int i = cursor + 1; i < route.size(); i++)
@@ -227,6 +224,7 @@ public final class WalkSession
 			}
 		}
 		boolean onRoute = false;
+		int previousCursor = cursor;
 		for (int i = cursor; i <= boundary; i++)
 		{
 			if (route.get(i).tile.equals(position))
@@ -234,6 +232,14 @@ public final class WalkSession
 				cursor = i;
 				onRoute = true;
 			}
+		}
+		if (cursor > previousCursor)
+		{
+			progressTick = tick;
+		}
+		if (tick - progressTick >= stuckTicks)
+		{
+			return replan(tick, "No movement progress");
 		}
 		if (!onRoute && (cursor >= route.size() || position.distance(route.get(cursor).tile) > 12))
 		{
@@ -282,6 +288,7 @@ public final class WalkSession
 			return replan(tick, "No reachable local waypoint");
 		}
 		waypoint = next.tile;
+		bestWaypointDistance = position.distance(waypoint);
 		actionTick = tick;
 		return new Decision(Kind.WALK, next);
 	}
