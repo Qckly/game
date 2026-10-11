@@ -1,0 +1,522 @@
+package net.runelite.client.plugins.shortestpath.pathfinder;
+
+import java.util.List;
+import java.util.Set;
+
+import lombok.Getter;
+import net.runelite.client.plugins.shortestpath.PrimitiveIntList;
+import net.runelite.client.plugins.shortestpath.WorldPointUtil;
+import net.runelite.client.plugins.shortestpath.leagues.LeagueModeState;
+
+public class Pathfinder implements ActiveSearch
+{
+	private final PathfinderStats stats;
+	@Getter
+	private final int start;
+	@Getter
+	private final Set<Integer> targets;
+	// Termination set resolved by TargetGoals: the requested targets plus, for
+	// each blocked target, its fallback tiles (issue #640).
+	private final Set<Integer> goals;
+	// Whether any requested target could possibly terminate the search: non-blocked,
+	// a transport destination, or resolved to at least one walkable nearby tile.
+	// When false the search is skipped entirely, since no goal can ever be visited.
+	private final boolean hasViableGoal;
+	// When set, sail in the 16 boat headings instead of taking walking steps (see SailingMoves), keeping the boat's whole
+	// hull clear if it has one, and arrive as SailingSearch says
+	private final SailingSearch sailing;
+	private final PathfinderConfig config;
+	private final CollisionMap map;
+	private final boolean targetInWilderness;
+	private final boolean targetInBlockedRegion;
+	private final Runnable completionCallback;
+	// Nodes are stored structure-of-arrays style: each node is an int id into the graph, instead of
+	// an object per explored tile. This keeps a whole search to a handful of arrays (issue #491).
+	private final NodeGraph graph = new NodeGraph(1 << 14);
+	// Capacities should be enough to store all nodes without requiring the queue to grow
+	// They were found by checking the max queue size
+	private final IntDeque boundary = new IntDeque(4096);
+	private final IntMinHeap pending = new IntMinHeap(graph, 256);
+	private final VisitedTiles visited;
+	@Getter
+	private volatile boolean done = false;
+	private volatile boolean cancelled = false;
+	// Read by the render thread during the search to draw the partial path; written by the worker.
+	private volatile int bestLastNode = NodeGraph.NO_NODE;
+	// The path the render thread builds progressively while the search runs.
+	private List<PathStep> pathSteps = List.of();
+	private boolean pathNeedsUpdate = false;
+	// Built once on the worker thread when the search finishes, then served to the render thread so
+	// it never walks the node chain (which is released) after the search is done.
+	private volatile List<PathStep> finalPath = null;
+	private volatile int closestReachedPoint = WorldPointUtil.UNDEFINED;
+	private volatile int finalPathCost = PathfinderResult.NO_PATH_COST;
+	private int bestRemainingDistance = Integer.MAX_VALUE;
+	private int bestTravelledDistance = Integer.MAX_VALUE;
+	private int bestX = Integer.MAX_VALUE;
+	private int bestY = Integer.MAX_VALUE;
+	// First explored node within the configured unreachable distance.
+	private int shortestAcceptedNode = NodeGraph.NO_NODE;
+	private int shortestAcceptedTarget = WorldPointUtil.UNDEFINED;
+	private int reachedTarget = WorldPointUtil.UNDEFINED;
+	private PathTerminationReason terminationReason;
+	/**
+	 * Teleportation transports are updated when this changes.
+	 * Can be either:
+	 * 0 = all teleports can be used (e.g. Chronicle)
+	 * 20 = most teleports can be used (e.g. Varrock Teleport)
+	 * 30 = some teleports can be used (e.g. Amulet of Glory)
+	 * 31 = no teleports can be used
+	 */
+	private int wildernessLevel;
+
+	public Pathfinder(PathfinderConfig config, int start, Set<Integer> targets, Runnable completionCallback)
+	{
+		this(config, start, targets, completionCallback, null);
+	}
+
+	/**
+	 * @param sailingMoves the boat's moves, to sail instead of walk, or {@code null} to walk
+	 */
+	public Pathfinder(PathfinderConfig config, int start, Set<Integer> targets, Runnable completionCallback,
+		SailingMoves sailingMoves)
+	{
+		this(config, start, targets, completionCallback, sailingMoves, null);
+	}
+
+	/**
+	 * @param sailingMoves the boat's moves, to sail instead of walk, or {@code null} to walk
+	 * @param boatHull     the boat's hull, which must fit along every sailing move, or {@code null} for just its centre
+	 */
+	public Pathfinder(PathfinderConfig config, int start, Set<Integer> targets, Runnable completionCallback,
+		SailingMoves sailingMoves, BoatHull boatHull)
+	{
+		stats = new PathfinderStats();
+		this.config = config;
+		this.map = config.getMap();
+		this.start = start;
+		this.targets = targets;
+		TargetGoals resolved = TargetGoals.resolve(config, start, targets);
+		this.goals = resolved.goals();
+		this.hasViableGoal = resolved.hasViableGoal();
+		this.sailing = sailingMoves == null ? null
+			: new SailingSearch(sailingMoves, boatHull, targets.stream().mapToInt(Integer::intValue).toArray(),
+				goals.stream().mapToInt(Integer::intValue).toArray());
+		this.completionCallback = completionCallback;
+		visited = new VisitedTiles(map, config.getBankVisitCost());
+		targetInWilderness = WildernessChecker.isInWilderness(targets);
+		targetInBlockedRegion = anyInBlockedRegion(config.getLeagueModeState(), targets);
+		wildernessLevel = 31;
+	}
+
+	/**
+	 * Whether this search sails the boat's headings rather than walking, so its path has a point at the end of each
+	 * move, a few tiles apart, rather than at every tile.
+	 */
+	public boolean isSailing()
+	{
+		return sailing != null;
+	}
+
+	private static boolean anyInBlockedRegion(LeagueModeState league, Set<Integer> packed)
+	{
+		if (!league.isSeasonal() || packed == null || packed.isEmpty())
+		{
+			return false;
+		}
+		for (Integer point : packed)
+		{
+			if (league.isInBlockedRegion(point))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public Pathfinder(PathfinderConfig config, int start, Set<Integer> targets)
+	{
+		this(config, start, targets, null);
+	}
+
+	public void cancel()
+	{
+		cancelled = true;
+	}
+
+	public PathfinderStats getStats()
+	{
+		if (stats.started && stats.ended)
+		{
+			return stats;
+		}
+
+		// Don't give incomplete results
+		return null;
+	}
+
+	public List<PathStep> getPath()
+	{
+		int lastNode = bestLastNode; // For thread safety, read bestLastNode once
+		if (lastNode == NodeGraph.NO_NODE)
+		{
+			List<PathStep> finalised = finalPath;
+			return finalised != null ? finalised : pathSteps;
+		}
+
+		// Once the search is finished the node graph is released, so serve the pre-built snapshot.
+		if (done)
+		{
+			List<PathStep> finalised = finalPath;
+			if (finalised != null)
+			{
+				return finalised;
+			}
+		}
+
+		if (pathNeedsUpdate)
+		{
+			List<PathStep> walked = graph.getPathSteps(lastNode);
+			// An empty result means the graph was released mid-walk; keep the last good path.
+			if (!walked.isEmpty())
+			{
+				pathSteps = walked;
+				pathNeedsUpdate = false;
+			}
+		}
+
+		return pathSteps;
+	}
+
+	public PathfinderResult getResult()
+	{
+		PathfinderStats currentStats = getStats();
+		if (currentStats == null)
+		{
+			return null;
+		}
+
+		List<PathStep> currentPath = getPath();
+		boolean reached = reachedTarget != WorldPointUtil.UNDEFINED;
+		int target = reached ? reachedTarget : (targets.isEmpty() ? WorldPointUtil.UNDEFINED : targets.iterator().next());
+		// getStats() only returns non-null once the search has ended, so the snapshot is set.
+		return new PathfinderResult(
+			start,
+			target,
+			reached,
+			currentPath,
+			closestReachedPoint,
+			finalPathCost,
+			currentStats.getNodesChecked(),
+			currentStats.getTransportsChecked(),
+			currentStats.getElapsedTimeNanos(),
+			terminationReason
+		);
+	}
+
+	private void addNeighbors(int node, boolean nodeIsTile, int nodePacked)
+	{
+		PrimitiveIntList nodes = map.getNeighbors(node, visited, config, wildernessLevel, targetInWilderness, graph,
+			sailing);
+		final int count = nodes.size();
+		for (int i = 0; i < count; i++)
+		{
+			int neighbor = nodes.get(i);
+			// Each graph.xxx(id) re-indexes a backing array, so read each neighbour field once and
+			// reuse the loop-invariant node fields passed in (the JIT cached these for free when nodes
+			// were objects, but not when they are int ids into structure-of-arrays storage).
+			final boolean neighborIsTile = graph.isTile(neighbor);
+			if (nodeIsTile && neighborIsTile)
+			{
+				final int neighborPacked = graph.packedPosition(neighbor);
+				if (config.avoidWilderness(nodePacked, neighborPacked, targetInWilderness))
+				{
+					continue;
+				}
+				if (config.avoidBlockedRegion(nodePacked, neighborPacked, targetInBlockedRegion))
+				{
+					continue;
+				}
+				if (graph.isWeighted(neighbor))
+				{
+					// A sailing move crosses its whole span at once; check its midpoint too, so a
+					// leg can't clip a wilderness or league boundary inside its reach
+					final int midPacked = WorldPointUtil.packWorldPoint(
+						(WorldPointUtil.unpackWorldX(nodePacked) + WorldPointUtil.unpackWorldX(neighborPacked)) / 2,
+						(WorldPointUtil.unpackWorldY(nodePacked) + WorldPointUtil.unpackWorldY(neighborPacked)) / 2,
+						WorldPointUtil.unpackWorldPlane(nodePacked));
+					if (config.avoidWilderness(nodePacked, midPacked, targetInWilderness)
+						|| config.avoidWilderness(midPacked, neighborPacked, targetInWilderness)
+						|| config.avoidBlockedRegion(nodePacked, midPacked, targetInBlockedRegion)
+						|| config.avoidBlockedRegion(midPacked, neighborPacked, targetInBlockedRegion))
+					{
+						continue;
+					}
+				}
+			}
+
+			final boolean neighborIsTransport = graph.isTransport(neighbor);
+			// Transports and sailing tiles queue on the cost-ordered pending heap, so
+			// marking their destination visited at enqueue would let an expensive
+			// queued one shadow a cheaper route emitted later; they are checked and
+			// marked when dequeued instead. Walking-tile and abstract neighbours still
+			// claim their tile at enqueue.
+			final boolean queuedByCost = neighborIsTransport || graph.isWeighted(neighbor);
+			if (!queuedByCost)
+			{
+				visited.set(neighbor, graph);
+			}
+			if (queuedByCost)
+			{
+				pending.add(neighbor);
+				if (neighborIsTransport)
+				{
+					++stats.transportsChecked;
+				}
+				else
+				{
+					// Only now, past the checks above, is the sailing tile queued at this cost, so a move they turn
+					// down doesn't stop another route from queuing the tile
+					final int packed = graph.packedPosition(neighbor);
+					sailing.setQueuedCost(WorldPointUtil.unpackWorldX(packed), WorldPointUtil.unpackWorldY(packed),
+						WorldPointUtil.unpackWorldPlane(packed), graph.bankVisited(neighbor), graph.cost(neighbor));
+					++stats.nodesChecked;
+				}
+			}
+			else
+			{
+				boundary.addLast(neighbor);
+				++stats.nodesChecked;
+			}
+		}
+	}
+
+	/**
+	 * Pathfinding to an unreachable target is slightly different from normal pathfinding.
+	 * Straight-line movement before diagonal movement is no longer prioritized, because the
+	 * original target is moved to the closest reachable tile. To avoid having to move the
+	 * original target we instead do the following to favour the closest reachable tile:
+	 * - 1) Pick the path with the minimum Euclidean distance (no need to use square root though)
+	 * - 2) If a tie occurs, pick the path with minimum travelled distance
+	 * - 3) If another tie occurs, pick the path with minimum x-coordinate
+	 * - 4) If another tie occurs, pick the path with minimum y-coordinate
+	 */
+	private boolean updateBestPathWhenUnreachable(int node, int packedPosition)
+	{
+		boolean update = false;
+
+		final int travelledDistance = graph.cost(node);
+		for (int target : targets)
+		{
+			int remainingDistance = WorldPointUtil.distanceBetween(target, packedPosition, WorldPointUtil.EUCLIDEAN_SQUARED_DISTANCE_METRIC);
+			int x = WorldPointUtil.unpackWorldX(packedPosition);
+			int y = WorldPointUtil.unpackWorldY(packedPosition);
+			if ((remainingDistance < bestRemainingDistance) ||
+				(remainingDistance == bestRemainingDistance && travelledDistance < bestTravelledDistance) ||
+				(remainingDistance == bestRemainingDistance && travelledDistance == bestTravelledDistance && x < bestX) ||
+				(remainingDistance == bestRemainingDistance && travelledDistance == bestTravelledDistance && x == bestX && y < bestY))
+			{
+				bestRemainingDistance = remainingDistance;
+				bestTravelledDistance = travelledDistance;
+				bestX = x;
+				bestY = y;
+				bestLastNode = node;
+				pathNeedsUpdate = true;
+				update = true;
+			}
+		}
+
+		return update;
+	}
+
+	private void updateCustomPathWhenUnreachable(int node, int packedPosition)
+	{
+		// Not for a sailing search: accepting the first tile near a target could truncate the path
+		// before the hull reaches a heading that covers one
+		if (targets.size() <= 1 || sailing != null || shortestAcceptedNode != NodeGraph.NO_NODE)
+		{
+			return;
+		}
+
+		for (int target : targets)
+		{
+			if (WorldPointUtil.distanceBetween(target, packedPosition, WorldPointUtil.MANHATTAN_DISTANCE_METRIC) <= config.getUnreachableTargetDistance())
+			{
+				shortestAcceptedNode = node;
+				shortestAcceptedTarget = target;
+				return;
+			}
+		}
+	}
+
+	/**
+	 * Update wilderness level based on the current node position.
+	 */
+	private void updateWildernessLevel(int packedPosition)
+	{
+		if (wildernessLevel > 0)
+		{
+			// These are overlapping boundaries, so if the node isn't in level 30, it's in 0-29
+			// likewise, if the node isn't in level 20, it's in 0-19
+			if (wildernessLevel > 30 && !WildernessChecker.isInLevel30Wilderness(packedPosition))
+			{
+				wildernessLevel = 30;
+			}
+			if (wildernessLevel > 20 && !WildernessChecker.isInLevel20Wilderness(packedPosition))
+			{
+				wildernessLevel = 20;
+			}
+			if (wildernessLevel > 0 && !WildernessChecker.isInWilderness(packedPosition))
+			{
+				wildernessLevel = 0;
+			}
+		}
+	}
+
+	@Override
+	public void run()
+	{
+		stats.start();
+		boundary.addFirst(graph.createStart(start));
+
+		// The cutoff counts time without progress towards the target.
+		SearchDeadline deadline = new SearchDeadline(config.getCalculationCutoffMillis());
+
+		// When every target is a blocked tile that no transport lands on and no
+		// walkable tile exists within the unreachable distance, no node can ever
+		// satisfy the goal set — skip the search instead of exhausting the map.
+		// A sailing search still runs: its hull can cover a target the walking
+		// goals can't reach, which is what it arrives on rather than the goal set.
+		while (!cancelled && (hasViableGoal || (sailing != null && !targets.isEmpty()))
+			&& (!boundary.isEmpty() || !pending.isEmpty()))
+		{
+			int boundaryHead = boundary.peekFirst();
+			int pendingHead = pending.peek();
+
+			int node;
+			// On a cost tie the pending heap wins: a queued transport that is strictly
+			// cheaper than the walking route must claim its destination before an
+			// equal-cost boundary node can expand and emit a competing walking edge.
+			if (pendingHead != NodeGraph.NO_NODE
+				&& (boundaryHead == NodeGraph.NO_NODE || graph.compareCost(pendingHead) <= graph.cost(boundaryHead)))
+			{
+				node = pending.poll();
+
+				// Every node in pending is transport-flagged (transports and bank-visit
+				// transitions) or a sailing tile; walking tiles and abstract nodes never
+				// enter it, and none of them claimed their destination at enqueue. The
+				// first, cheapest, dequeue wins the tile; later queued duplicates for the
+				// same tile are dropped here — unless the duplicate is a sailing move that
+				// arrives on its own heading, queued for it because the settled heading
+				// didn't cover a target.
+				int packed = graph.packedPosition(node);
+				boolean bank = graph.bankVisited(node);
+				if (visited.get(packed, bank)
+					&& !(sailing != null && graph.isWeighted(node)
+						&& sailing.arrivedTarget(packed,
+							CollisionMap.sailingArrivalHeading(graph, node, sailing.moves)) != WorldPointUtil.UNDEFINED))
+				{
+					continue;
+				}
+				visited.set(packed, bank);
+			}
+			else
+			{
+				node = boundary.pollFirst();
+			}
+			if (node == NodeGraph.NO_NODE)
+			{
+				continue;
+			}
+			// Read the node's tile-ness and position once; every graph.xxx(id) re-indexes a backing
+			// array, and these are used by several of the checks below.
+			final boolean nodeIsTile = graph.isTile(node);
+			final int nodePacked = nodeIsTile ? graph.packedPosition(node) : WorldPointUtil.UNDEFINED;
+			if (nodeIsTile)
+			{
+				updateWildernessLevel(nodePacked);
+
+				final int arrivedTarget = sailing != null
+					? sailing.arrivedTarget(nodePacked, CollisionMap.sailingArrivalHeading(graph, node, sailing.moves))
+					: WorldPointUtil.UNDEFINED;
+				if (goals.contains(nodePacked) || arrivedTarget != WorldPointUtil.UNDEFINED)
+				{
+					bestLastNode = node;
+					// A sailing arrival reports the target the hull covers, which can sit a
+					// boat length from the boat's tile rather than on it
+					reachedTarget = goals.contains(nodePacked) ? nodePacked : arrivedTarget;
+					if (shortestAcceptedNode != NodeGraph.NO_NODE)
+					{
+						bestLastNode = shortestAcceptedNode;
+						reachedTarget = shortestAcceptedTarget;
+					}
+					pathNeedsUpdate = true;
+					terminationReason = PathTerminationReason.TARGET_REACHED;
+					break;
+				}
+
+				if (updateBestPathWhenUnreachable(node, nodePacked))
+				{
+					deadline.progressed();
+				}
+				updateCustomPathWhenUnreachable(node, nodePacked);
+			}
+
+			if (deadline.expired())
+			{
+				terminationReason = PathTerminationReason.CUTOFF_REACHED;
+				break;
+			}
+
+			addNeighbors(node, nodeIsTile, nodePacked);
+		}
+
+		if (cancelled)
+		{
+			terminationReason = PathTerminationReason.CANCELLED;
+		}
+		else if (terminationReason == null)
+		{
+			terminationReason = PathTerminationReason.SEARCH_EXHAUSTED;
+		}
+
+		// Materialise the final path and closest reached tile on the worker thread, publish them,
+		// then release the large node graph. Once done is set the render thread serves finalPath
+		// and never touches the released graph, so this is race-free with progressive rendering.
+		int lastNode = bestLastNode;
+		if (lastNode != NodeGraph.NO_NODE)
+		{
+			finalPath = graph.getPathSteps(lastNode);
+			closestReachedPoint = graph.getClosestTilePosition(lastNode);
+			finalPathCost = graph.cost(lastNode);
+		}
+		else
+		{
+			finalPath = pathSteps;
+			closestReachedPoint = start;
+			finalPathCost = PathfinderResult.NO_PATH_COST;
+		}
+
+		done = !cancelled;
+
+		boundary.clear();
+		visited.clear();
+		pending.clear();
+		graph.release();
+		if (sailing != null)
+		{
+			sailing.release();
+		}
+
+		stats.end(); // Include cleanup in stats to get the total cost of pathfinding
+
+		if (completionCallback != null)
+		{
+			completionCallback.run();
+		}
+	}
+
+	public static class PathfinderStats extends net.runelite.client.plugins.shortestpath.pathfinder.PathfinderStats
+	{
+	}
+}
