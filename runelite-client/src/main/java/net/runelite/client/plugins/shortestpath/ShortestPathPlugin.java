@@ -2,6 +2,7 @@ package net.runelite.client.plugins.shortestpath;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.inject.Inject;
+import com.google.inject.Module;
 import com.google.inject.Provides;
 import java.awt.Color;
 import java.awt.Polygon;
@@ -111,6 +112,12 @@ import net.runelite.client.plugins.shortestpath.transport.TransportType;
 	"navigation"})
 public class ShortestPathPlugin extends Plugin
 {
+    @Override
+    protected Module getPublicModule()
+    {
+        return binder -> binder.bind(ShortestPathPlugin.class).toInstance(this);
+    }
+
 	protected static final String CONFIG_GROUP = "shortestpath";
 
 	// POH (Player Owned House) bounds for detecting when path goes through POH
